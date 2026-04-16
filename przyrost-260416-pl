@@ -1,0 +1,423 @@
+-- ==================================================
+-- WYMAGANE ZMIANY DDL PRZED WDROŻENIEM PAKIETU
+-- ==================================================
+-- 1. Tabela etl_audit_log – dodanie kolumn okna czasowego:
+--    ALTER TABLE etl_audit_log ADD (ekstrahuj_od TIMESTAMP, ekstrahuj_do TIMESTAMP);
+--
+-- 2. Tabela etl_hwm_control – jeden wiersz zamiast trzech:
+--    DELETE FROM etl_hwm_control WHERE nazwa_procesu IN ('BATCH_1','BATCH_2','BATCH_3');
+--    INSERT INTO etl_hwm_control (nazwa_procesu, ostatni_udany_run, status_procesu, dni_fragmentu, docelowy_run)
+--    VALUES ('ETL_DELTA_GLOWNY', <data_startowa>, 'UKONCZONE', 0, NULL);
+--    COMMIT;
+--
+-- SEKWENCJA WYWOLAN Z NARZEDZIA ZEWNETRZNEGO (DataStage):
+--    1. prc_wyczysc_wszystkie_stg
+--    2. prc_otworz_run
+--    3. PARALLEL: prc_ekstrahuj_delte_batch_1 || prc_ekstrahuj_delte_batch_2 || prc_ekstrahuj_delte_batch_3
+--    4. PARALLEL: prc_zaladuj_fkt_polisy || prc_zaladuj_fkt_... (pozostale fakty)
+--    5. prc_zamknij_run
+-- ==================================================
+
+CREATE OR REPLACE PACKAGE BODY pkg_etl_delta_zasilanie IS
+
+    -- ==================================================
+    -- KONFIGURACJA PAKIETU
+    -- ==================================================
+    c_interwal_nakladania  CONSTANT INTERVAL DAY TO SECOND := INTERVAL '15' MINUTE;
+    c_nazwa_procesu_hwm    CONSTANT VARCHAR2(30)            := 'ETL_DELTA_GLOWNY';
+
+    -- ==================================================
+    -- AUTONOMICZNA PROCEDURA AUDYTOWA
+    -- ==================================================
+    PROCEDURE log_audyt(
+        p_proces        VARCHAR2,
+        p_krok          VARCHAR2,
+        p_wiersze       NUMBER,
+        p_status        VARCHAR2,
+        p_blad          VARCHAR2  DEFAULT NULL,
+        p_ekstrahuj_od  TIMESTAMP DEFAULT NULL,
+        p_ekstrahuj_do  TIMESTAMP DEFAULT NULL
+    ) IS
+        PRAGMA AUTONOMOUS_TRANSACTION;
+    BEGIN
+        INSERT INTO etl_audit_log (
+            znacznik_czasu, nazwa_procesu, nazwa_kroku, wiersze_przetworzone,
+            status, komunikat_bledu, ekstrahuj_od, ekstrahuj_do
+        )
+        VALUES (
+            SYSTIMESTAMP, p_proces, p_krok, p_wiersze,
+            p_status, SUBSTR(p_blad, 1, 4000), p_ekstrahuj_od, p_ekstrahuj_do
+        );
+        COMMIT;
+    END log_audyt;
+
+    -- ==================================================
+    -- PRYWATNA PROCEDURA POMOCNICZA: ODCZYT OKNA RUNU
+    -- Wywolywana przez kazdy batch – jedno miejsce odczytu HWM
+    -- ==================================================
+    PROCEDURE pobierz_okno_runu(
+        p_ekstrahuj_od OUT TIMESTAMP,
+        p_ekstrahuj_do OUT TIMESTAMP
+    ) IS
+    BEGIN
+        SELECT ostatni_udany_run - c_interwal_nakladania,
+               docelowy_run
+        INTO   p_ekstrahuj_od, p_ekstrahuj_do
+        FROM   etl_hwm_control
+        WHERE  nazwa_procesu   = c_nazwa_procesu_hwm
+          AND  status_procesu  = 'W_TRAKCIE';
+    EXCEPTION
+        WHEN NO_DATA_FOUND THEN
+            RAISE_APPLICATION_ERROR(-20001,
+                'BLAD: Brak aktywnego runu W_TRAKCIE dla ' || c_nazwa_procesu_hwm ||
+                '. Upewnij sie, ze prc_otworz_run zostal wywolany przed batchami.');
+    END pobierz_okno_runu;
+
+    -- ==================================================
+    -- PROCEDURA OTWIERAJACA RUN
+    -- Krok 2 sekwensera – wywolac przed odpaleniem batchow
+    -- ==================================================
+    PROCEDURE prc_otworz_run IS
+        v_ostatni_run         TIMESTAMP;
+        v_status              VARCHAR2(20);
+        v_dni_fragmentu       NUMBER;
+        v_docelowy_run        TIMESTAMP;
+    BEGIN
+        DBMS_APPLICATION_INFO.SET_MODULE('ETL_OTWORZ_RUN', 'Inicjalizacja');
+
+        -- Odczyt aktualnego HWM
+        BEGIN
+            SELECT ostatni_udany_run, status_procesu, dni_fragmentu
+            INTO   v_ostatni_run, v_status, v_dni_fragmentu
+            FROM   etl_hwm_control
+            WHERE  nazwa_procesu = c_nazwa_procesu_hwm;
+        EXCEPTION
+            WHEN NO_DATA_FOUND THEN
+                RAISE_APPLICATION_ERROR(-20002,
+                    'BLAD: Brak wpisu HWM dla ' || c_nazwa_procesu_hwm ||
+                    '. Wykonaj skrypt inicjalizacyjny przed pierwszym uruchomieniem.');
+        END;
+
+        -- Ostrzezenie przy nienormalnym poprzednim statusie
+        IF v_status <> 'UKONCZONE' THEN
+            log_audyt(c_nazwa_procesu_hwm, 'OTWORZ RUN', 0, 'OSTRZEZENIE',
+                'Poprzedni status: ' || v_status || '. Wznawianie od ostatniego zatwierdzonego HWM.');
+        END IF;
+
+        -- Wyliczenie sufitu czasowego – jedyne miejsce tej logiki w calym pakiecie
+        IF v_dni_fragmentu = 0 THEN
+            v_docelowy_run := SYSTIMESTAMP;                                    -- Tryb: zwykla delta nocna
+        ELSE
+            v_docelowy_run := v_ostatni_run + v_dni_fragmentu;                 -- Tryb: zasilenie inicjalne w oknach
+            IF v_docelowy_run > SYSTIMESTAMP THEN
+                v_docelowy_run := SYSTIMESTAMP;                                -- Zabezpieczenie przed wybieganiem w przyszlosc
+            END IF;
+        END IF;
+
+        -- Zablokowanie HWM i zamrozenie okna dla wszystkich batchow
+        UPDATE etl_hwm_control
+        SET    status_procesu  = 'W_TRAKCIE',
+               docelowy_run    = v_docelowy_run
+        WHERE  nazwa_procesu   = c_nazwa_procesu_hwm;
+
+        COMMIT;
+
+        log_audyt(
+            c_nazwa_procesu_hwm, 'OTWORZ RUN', 0, 'W_TRAKCIE',
+            'Okno zatwierdzone dla wszystkich batchow.',
+            v_ostatni_run - c_interwal_nakladania,
+            v_docelowy_run
+        );
+
+        DBMS_APPLICATION_INFO.SET_MODULE(NULL, NULL);
+    EXCEPTION
+        WHEN OTHERS THEN
+            ROLLBACK;
+            log_audyt(c_nazwa_procesu_hwm, 'OTWORZ RUN', 0, 'BLAD', SQLERRM);
+            DBMS_APPLICATION_INFO.SET_MODULE(NULL, NULL);
+            RAISE;
+    END prc_otworz_run;
+
+    -- ==================================================
+    -- BATCH 1 (Tabele 1 – 5)
+    -- ==================================================
+    PROCEDURE prc_ekstrahuj_delte_batch_1 IS
+        v_ekstrahuj_od       TIMESTAMP;
+        v_ekstrahuj_do       TIMESTAMP;
+        v_biezacy_krok       VARCHAR2(50) := 'Inicjalizacja';
+        v_wiersze_przetw     NUMBER;
+    BEGIN
+        DBMS_APPLICATION_INFO.SET_MODULE('ETL_BATCH_1', 'Ekstrakcja');
+        log_audyt('BATCH_1', 'START BATCH 1', 0, 'W_TRAKCIE');
+
+        -- Odczyt zamrozonego okna – identyczny dla wszystkich batchow
+        pobierz_okno_runu(v_ekstrahuj_od, v_ekstrahuj_do);
+
+        EXECUTE IMMEDIATE 'ALTER SESSION ENABLE PARALLEL DML';
+
+        -- Ekstrakcja: TABELA_1
+        v_biezacy_krok := 'Ekstrakcja: TABELA_1';
+        DBMS_APPLICATION_INFO.SET_ACTION(v_biezacy_krok);
+
+        MERGE /*+ PARALLEL(cel) PARALLEL(zrodlo) */ INTO stg_tab_1 cel
+        USING (
+            -- STRUMIEN A: Delta po kolumnie audytowej
+            SELECT id_1 FROM tabela_1
+            WHERE  CZAS_AKTUALIZACJI_REKORDU >= v_ekstrahuj_od
+              AND  CZAS_AKTUALIZACJI_REKORDU <  v_ekstrahuj_do
+            UNION
+            -- STRUMIEN B: Manual Override
+            SELECT t.id_1 FROM tabela_1 t
+            INNER JOIN etl_manual_refresh m ON t.id_1 = m.record_id
+            WHERE  m.table_source = 'TABELA_1'
+              AND  m.batch_name   = 'BATCH_1'
+              AND  m.status       = 'OCZEKUJE'
+        ) zrodlo
+        ON (cel.record_id = zrodlo.id_1)
+        WHEN MATCHED     THEN UPDATE SET cel.extracted_at = v_ekstrahuj_do
+        WHEN NOT MATCHED THEN INSERT (record_id, extracted_at) VALUES (zrodlo.id_1, v_ekstrahuj_do);
+
+        v_wiersze_przetw := SQL%ROWCOUNT;
+        COMMIT;
+        log_audyt('BATCH_1', v_biezacy_krok, v_wiersze_przetw, 'SUKCES',
+            NULL, v_ekstrahuj_od, v_ekstrahuj_do);
+
+        -- [Tabele 2–5 analogicznie do TABELA_1...]
+
+        log_audyt('BATCH_1', 'KONIEC EKSTRAKCJI BATCH 1', 0, 'UKONCZONE',
+            NULL, v_ekstrahuj_od, v_ekstrahuj_do);
+        EXECUTE IMMEDIATE 'ALTER SESSION DISABLE PARALLEL DML';
+        DBMS_APPLICATION_INFO.SET_MODULE(NULL, NULL);
+    EXCEPTION
+        WHEN OTHERS THEN
+            ROLLBACK;
+            log_audyt('BATCH_1', v_biezacy_krok, 0, 'BLAD', SQLERRM);
+            DBMS_APPLICATION_INFO.SET_MODULE(NULL, NULL);
+            BEGIN EXECUTE IMMEDIATE 'ALTER SESSION DISABLE PARALLEL DML'; EXCEPTION WHEN OTHERS THEN NULL; END;
+            RAISE;
+    END prc_ekstrahuj_delte_batch_1;
+
+    -- ==================================================
+    -- BATCH 2 (Tabele 6 – 10)
+    -- ==================================================
+    PROCEDURE prc_ekstrahuj_delte_batch_2 IS
+        v_ekstrahuj_od   TIMESTAMP;
+        v_ekstrahuj_do   TIMESTAMP;
+        v_biezacy_krok   VARCHAR2(50) := 'Inicjalizacja';
+        v_wiersze_przetw NUMBER;
+    BEGIN
+        DBMS_APPLICATION_INFO.SET_MODULE('ETL_BATCH_2', 'Ekstrakcja');
+        log_audyt('BATCH_2', 'START BATCH 2', 0, 'W_TRAKCIE');
+
+        pobierz_okno_runu(v_ekstrahuj_od, v_ekstrahuj_do);
+
+        EXECUTE IMMEDIATE 'ALTER SESSION ENABLE PARALLEL DML';
+
+        -- [Ekstrakcja do stg_tab_6 ... stg_tab_10 analogicznie do BATCH_1...]
+
+        log_audyt('BATCH_2', 'KONIEC EKSTRAKCJI BATCH 2', 0, 'UKONCZONE',
+            NULL, v_ekstrahuj_od, v_ekstrahuj_do);
+        EXECUTE IMMEDIATE 'ALTER SESSION DISABLE PARALLEL DML';
+        DBMS_APPLICATION_INFO.SET_MODULE(NULL, NULL);
+    EXCEPTION
+        WHEN OTHERS THEN
+            ROLLBACK;
+            log_audyt('BATCH_2', v_biezacy_krok, 0, 'BLAD', SQLERRM);
+            DBMS_APPLICATION_INFO.SET_MODULE(NULL, NULL);
+            BEGIN EXECUTE IMMEDIATE 'ALTER SESSION DISABLE PARALLEL DML'; EXCEPTION WHEN OTHERS THEN NULL; END;
+            RAISE;
+    END prc_ekstrahuj_delte_batch_2;
+
+    -- ==================================================
+    -- BATCH 3 (Tabele 11 – 15)
+    -- ==================================================
+    PROCEDURE prc_ekstrahuj_delte_batch_3 IS
+        v_ekstrahuj_od   TIMESTAMP;
+        v_ekstrahuj_do   TIMESTAMP;
+        v_biezacy_krok   VARCHAR2(50) := 'Inicjalizacja';
+        v_wiersze_przetw NUMBER;
+    BEGIN
+        DBMS_APPLICATION_INFO.SET_MODULE('ETL_BATCH_3', 'Ekstrakcja');
+        log_audyt('BATCH_3', 'START BATCH 3', 0, 'W_TRAKCIE');
+
+        pobierz_okno_runu(v_ekstrahuj_od, v_ekstrahuj_do);
+
+        EXECUTE IMMEDIATE 'ALTER SESSION ENABLE PARALLEL DML';
+
+        -- [Ekstrakcja do stg_tab_11 ... stg_tab_15 analogicznie do BATCH_1...]
+
+        log_audyt('BATCH_3', 'KONIEC EKSTRAKCJI BATCH 3', 0, 'UKONCZONE',
+            NULL, v_ekstrahuj_od, v_ekstrahuj_do);
+        EXECUTE IMMEDIATE 'ALTER SESSION DISABLE PARALLEL DML';
+        DBMS_APPLICATION_INFO.SET_MODULE(NULL, NULL);
+    EXCEPTION
+        WHEN OTHERS THEN
+            ROLLBACK;
+            log_audyt('BATCH_3', v_biezacy_krok, 0, 'BLAD', SQLERRM);
+            DBMS_APPLICATION_INFO.SET_MODULE(NULL, NULL);
+            BEGIN EXECUTE IMMEDIATE 'ALTER SESSION DISABLE PARALLEL DML'; EXCEPTION WHEN OTHERS THEN NULL; END;
+            RAISE;
+    END prc_ekstrahuj_delte_batch_3;
+
+    -- ==================================================
+    -- LADOWANIE FAKTOW
+    -- ==================================================
+    PROCEDURE prc_zaladuj_fkt_polisy IS
+        v_biezacy_krok   VARCHAR2(50) := 'Inicjalizacja';
+        v_wiersze_przetw NUMBER;
+    BEGIN
+        DBMS_APPLICATION_INFO.SET_MODULE('ETL_LADUJ_FAKT', 'fkt_polisy');
+        log_audyt('LADUJ_FAKT', 'START LADOWANIA fkt_polisy', 0, 'W_TRAKCIE');
+
+        EXECUTE IMMEDIATE 'ALTER SESSION ENABLE PARALLEL DML';
+
+        v_biezacy_krok := 'Merge: fct_ubezpieczenia_sprzedaz';
+        DBMS_APPLICATION_INFO.SET_ACTION(v_biezacy_krok);
+
+        MERGE /*+ PARALLEL(cel) PARALLEL(zrodlo) */
+        INTO fct_ubezpieczenia_sprzedaz cel
+        USING (
+            SELECT t.id_1          AS id_polisy,
+                   t.kwota_skladki,
+                   t.data_zawarcia,
+                   t.id_agenta,
+                   t.kod_produktu,
+                   t.status_polisy
+            FROM   tabela_1 t
+            INNER JOIN stg_tab_1 stg ON t.id_1 = stg.record_id   -- Filtr wydajnosciowy przez STG
+        ) zrodlo
+        ON (cel.id_polisy = zrodlo.id_polisy)
+        WHEN MATCHED THEN
+            UPDATE SET
+                cel.kwota_skladki     = zrodlo.kwota_skladki,
+                cel.status_polisy     = zrodlo.status_polisy,
+                cel.id_agenta         = zrodlo.id_agenta,
+                cel.data_aktualizacji = SYSDATE
+        WHEN NOT MATCHED THEN
+            INSERT (id_polisy, kwota_skladki, data_zawarcia, id_agenta, kod_produktu, status_polisy, data_wstawienia)
+            VALUES (zrodlo.id_polisy, zrodlo.kwota_skladki, zrodlo.data_zawarcia,
+                    zrodlo.id_agenta, zrodlo.kod_produktu, zrodlo.status_polisy, SYSDATE);
+
+        v_wiersze_przetw := SQL%ROWCOUNT;
+        COMMIT;
+        log_audyt('LADUJ_FAKT', 'KONIEC LADOWANIA fkt_polisy', v_wiersze_przetw, 'UKONCZONE');
+        EXECUTE IMMEDIATE 'ALTER SESSION DISABLE PARALLEL DML';
+        DBMS_APPLICATION_INFO.SET_MODULE(NULL, NULL);
+    EXCEPTION
+        WHEN OTHERS THEN
+            ROLLBACK;
+            log_audyt('LADUJ_FAKT', v_biezacy_krok, 0, 'BLAD', SQLERRM);
+            DBMS_APPLICATION_INFO.SET_MODULE(NULL, NULL);
+            BEGIN EXECUTE IMMEDIATE 'ALTER SESSION DISABLE PARALLEL DML'; EXCEPTION WHEN OTHERS THEN NULL; END;
+            RAISE;
+    END prc_zaladuj_fkt_polisy;
+
+    -- ==================================================
+    -- PROCEDURA ZAMYKAJACA RUN
+    -- Krok 5 sekwensera – wywolac po zakonczeniu wszystkich ladowan
+    -- ==================================================
+    PROCEDURE prc_zamknij_run IS
+        v_docelowy_run TIMESTAMP;
+    BEGIN
+        DBMS_APPLICATION_INFO.SET_MODULE('ETL_ZAMKNIJ_RUN', c_nazwa_procesu_hwm);
+
+        -- Odczyt zatwierdzonego sufitu przed aktualizacja (potrzebny do logu)
+        SELECT docelowy_run
+        INTO   v_docelowy_run
+        FROM   etl_hwm_control
+        WHERE  nazwa_procesu = c_nazwa_procesu_hwm;
+
+        -- Przesuniecie HWM – tylko gdy status to faktycznie W_TRAKCIE
+        UPDATE etl_hwm_control
+        SET    ostatni_udany_run = docelowy_run,
+               status_procesu    = 'UKONCZONE'
+        WHERE  nazwa_procesu     = c_nazwa_procesu_hwm
+          AND  status_procesu    = 'W_TRAKCIE';
+
+        IF SQL%ROWCOUNT = 0 THEN
+            RAISE_APPLICATION_ERROR(-20003,
+                'BLAD: Proba zamkniecia runu w nieprawidlowym statusie dla: ' || c_nazwa_procesu_hwm ||
+                '. Oczekiwano W_TRAKCIE.');
+        END IF;
+
+        -- Zamkniecie wszystkich oczekujacych zlecen manualnych
+        UPDATE etl_manual_refresh
+        SET    status = 'UKONCZONE'
+        WHERE  status = 'OCZEKUJE';
+
+        COMMIT;
+
+        log_audyt(c_nazwa_procesu_hwm, 'ZAMKNIJ RUN', 0, 'UKONCZONE',
+            'HWM przesuniety do: ' || TO_CHAR(v_docelowy_run, 'YYYY-MM-DD HH24:MI:SS.FF3'));
+
+        DBMS_APPLICATION_INFO.SET_MODULE(NULL, NULL);
+    EXCEPTION
+        WHEN OTHERS THEN
+            ROLLBACK;
+            log_audyt(c_nazwa_procesu_hwm, 'ZAMKNIJ RUN', 0, 'BLAD', SQLERRM);
+            DBMS_APPLICATION_INFO.SET_MODULE(NULL, NULL);
+            RAISE;
+    END prc_zamknij_run;
+
+    -- ==================================================
+    -- PROCEDURA CZYSZCZACA STG
+    -- Krok 1 sekwensera – wywolac przed prc_otworz_run
+    -- ==================================================
+    PROCEDURE prc_wyczysc_wszystkie_stg IS
+        v_biezacy_krok        VARCHAR2(50) := 'Weryfikacja statusu';
+        v_liczba_aktywnych    NUMBER;
+    BEGIN
+        DBMS_APPLICATION_INFO.SET_MODULE('ETL_CZYSZCZENIE', 'Czyszczenie STG');
+        log_audyt('CZYSZCZENIE', 'START CZYSZCZENIA STG', 0, 'W_TRAKCIE');
+
+        -- Blokada przed czyszczeniem gdy aktywny run – ochrona przed race condition
+        SELECT COUNT(*)
+        INTO   v_liczba_aktywnych
+        FROM   etl_hwm_control
+        WHERE  nazwa_procesu   = c_nazwa_procesu_hwm
+          AND  status_procesu  = 'W_TRAKCIE';
+
+        IF v_liczba_aktywnych > 0 THEN
+            RAISE_APPLICATION_ERROR(-20010,
+                'BLAD: Nie mozna czyscic STG — aktywny run W_TRAKCIE. ' ||
+                'Sprawdz etl_hwm_control i etl_audit_log.');
+        END IF;
+
+        v_biezacy_krok := 'Czyszczenie STG BATCH 1';
+        DBMS_APPLICATION_INFO.SET_ACTION(v_biezacy_krok);
+        EXECUTE IMMEDIATE 'TRUNCATE TABLE stg_tab_1';
+        EXECUTE IMMEDIATE 'TRUNCATE TABLE stg_tab_2';
+        EXECUTE IMMEDIATE 'TRUNCATE TABLE stg_tab_3';
+        EXECUTE IMMEDIATE 'TRUNCATE TABLE stg_tab_4';
+        EXECUTE IMMEDIATE 'TRUNCATE TABLE stg_tab_5';
+        log_audyt('CZYSZCZENIE', v_biezacy_krok, 0, 'SUKCES');
+
+        v_biezacy_krok := 'Czyszczenie STG BATCH 2';
+        DBMS_APPLICATION_INFO.SET_ACTION(v_biezacy_krok);
+        EXECUTE IMMEDIATE 'TRUNCATE TABLE stg_tab_6';
+        EXECUTE IMMEDIATE 'TRUNCATE TABLE stg_tab_7';
+        EXECUTE IMMEDIATE 'TRUNCATE TABLE stg_tab_8';
+        EXECUTE IMMEDIATE 'TRUNCATE TABLE stg_tab_9';
+        EXECUTE IMMEDIATE 'TRUNCATE TABLE stg_tab_10';
+        log_audyt('CZYSZCZENIE', v_biezacy_krok, 0, 'SUKCES');
+
+        v_biezacy_krok := 'Czyszczenie STG BATCH 3';
+        DBMS_APPLICATION_INFO.SET_ACTION(v_biezacy_krok);
+        EXECUTE IMMEDIATE 'TRUNCATE TABLE stg_tab_11';
+        EXECUTE IMMEDIATE 'TRUNCATE TABLE stg_tab_12';
+        EXECUTE IMMEDIATE 'TRUNCATE TABLE stg_tab_13';
+        EXECUTE IMMEDIATE 'TRUNCATE TABLE stg_tab_14';
+        EXECUTE IMMEDIATE 'TRUNCATE TABLE stg_tab_15';
+        log_audyt('CZYSZCZENIE', v_biezacy_krok, 0, 'SUKCES');
+
+        log_audyt('CZYSZCZENIE', 'KONIEC CZYSZCZENIA STG', 0, 'UKONCZONE');
+        DBMS_APPLICATION_INFO.SET_MODULE(NULL, NULL);
+    EXCEPTION
+        WHEN OTHERS THEN
+            log_audyt('CZYSZCZENIE', v_biezacy_krok, 0, 'BLAD', SQLERRM);
+            DBMS_APPLICATION_INFO.SET_MODULE(NULL, NULL);
+            RAISE;
+    END prc_wyczysc_wszystkie_stg;
+
+END pkg_etl_delta_zasilanie;
+/
