@@ -21,3 +21,10 @@ for i in 0 1 2 3 4; do
         echo "Utworzono katalog: $DIR_NAME"
     fi
 done
+
+
+-c "for i in 0 1 2 3 4; do d=$(date -d \"+$i days\" +%d-%m-%Y); if [ ! -d #TargetDir#/$d ]; then mkdir -p #TargetDir#/$d && echo \"Utworzono: $d\"; else echo \"Istnieje: $d\"; fi; done"
+
+-c "for i in 0 1 2 3 4; do mkdir -p /data/staging/archive/$(date -d \"+$i days\" +%d-%m-%Y); done"
+
+-c "TARGET=#TargetDir#; for i in 0 1 2 3 4; do d=$(date -d \"+$i days\" +%d-%m-%Y); if [ ! -d $TARGET/$d ]; then mkdir -p $TARGET/$d && echo \"Utworzono: $TARGET/$d\"; else echo \"Istnieje: $TARGET/$d\"; fi; done"
