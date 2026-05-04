@@ -1,0 +1,73 @@
+CREATE OR REPLACE PROCEDURE wrq_czy_uruchomic (
+    p_wynik OUT VARCHAR2
+)
+AS
+    /* -----------------------------------------------------------------
+       Zwraca:
+         'T' - procedurę x należy uruchomić,
+         'N' - nie uruchamiać,
+         'B' - błąd (bez wpisu do warta_il.wrtp_ster_zaleznosci).
+
+       Reguły:
+       - patrzymy wyłącznie na STZ_DATA_ZAKONCZENIA,
+       - dzień = TRUNC(SYSDATE),
+       - 'T' wymaga wpisu HDP i GULIWER w bieżącym dniu oraz
+         (brak x w dniu LUB ostatni GULIWER > ostatni x).
+
+       Procedura jest idempotentna - sama nie zapisuje nic do tabeli;
+       wpis o uruchomieniu x dokonuje proces x / orchestrator.
+       ----------------------------------------------------------------- */
+
+    c_kontener     CONSTANT VARCHAR2(30) := 'DWLK_URUCHOMIENIE';
+    c_proc_hdp     CONSTANT VARCHAR2(60) := 'WRJS_DZN_HDP_PROCES_GODZINOWY';
+    c_proc_guliwer CONSTANT VARCHAR2(60) := 'WRJS_GULIWER_URUCHOMIENIE';
+    -- TODO: ustawić rzeczywistą nazwę zapisywaną w STZ_PROCES_ZAKONCZONY
+    --       dla procedury x (po jej zakończeniu).
+    c_proc_x       CONSTANT VARCHAR2(60) := 'WRQ_X';
+
+    l_dzien_od     DATE := TRUNC(SYSDATE);
+    l_dzien_do     DATE := TRUNC(SYSDATE) + 1;
+
+    l_max_hdp      DATE;
+    l_max_guliwer  DATE;
+    l_max_x        DATE;
+BEGIN
+    SELECT MAX(stz_data_zakonczenia)
+      INTO l_max_hdp
+      FROM warta_il.wrtp_ster_zaleznosci
+     WHERE stz_proces_oczekujacy = c_kontener
+       AND stz_proces_zakonczony = c_proc_hdp
+       AND stz_data_zakonczenia >= l_dzien_od
+       AND stz_data_zakonczenia <  l_dzien_do;
+
+    SELECT MAX(stz_data_zakonczenia)
+      INTO l_max_guliwer
+      FROM warta_il.wrtp_ster_zaleznosci
+     WHERE stz_proces_oczekujacy = c_kontener
+       AND stz_proces_zakonczony = c_proc_guliwer
+       AND stz_data_zakonczenia >= l_dzien_od
+       AND stz_data_zakonczenia <  l_dzien_do;
+
+    SELECT MAX(stz_data_zakonczenia)
+      INTO l_max_x
+      FROM warta_il.wrtp_ster_zaleznosci
+     WHERE stz_proces_oczekujacy = c_kontener
+       AND stz_proces_zakonczony = c_proc_x
+       AND stz_data_zakonczenia >= l_dzien_od
+       AND stz_data_zakonczenia <  l_dzien_do;
+
+    IF l_max_hdp     IS NOT NULL
+   AND l_max_guliwer IS NOT NULL
+   AND ( l_max_x IS NULL OR l_max_x < l_max_guliwer )
+    THEN
+        p_wynik := 'T';
+    ELSE
+        p_wynik := 'N';
+    END IF;
+
+EXCEPTION
+    WHEN OTHERS THEN
+        p_wynik := 'B';
+        -- celowo brak logowania do tabeli
+END wrq_czy_uruchomic;
+/
