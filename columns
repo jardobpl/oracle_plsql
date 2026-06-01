@@ -1,0 +1,37 @@
+SELECT
+    tc.column_name,
+    tc.data_type,
+    tc.column_id                  AS id,
+    pk.pk_pos                     AS pk,
+    idx.index_pos,
+    tc.nullable,
+    tc.num_distinct,
+    tc.num_nulls,
+    tc.density,
+    tc.histogram,
+    tc.virtual_column
+FROM   all_tab_columns tc
+LEFT JOIN (
+        SELECT cc.column_name, cc.position AS pk_pos
+        FROM   all_constraints  c
+        JOIN   all_cons_columns cc
+               ON cc.owner = c.owner
+              AND cc.constraint_name = c.constraint_name
+        WHERE  c.owner = 'CCUSER'
+        AND    c.table_name = 'CC_ACTIVITY'
+        AND    c.constraint_type = 'P'
+       ) pk
+       ON pk.column_name = tc.column_name
+LEFT JOIN (
+        SELECT column_name,
+               LISTAGG(column_position, ', ')
+                 WITHIN GROUP (ORDER BY index_name, column_position) AS index_pos
+        FROM   all_ind_columns
+        WHERE  table_owner = 'CCUSER'
+        AND    table_name  = 'CC_ACTIVITY'
+        GROUP BY column_name
+       ) idx
+       ON idx.column_name = tc.column_name
+WHERE  tc.owner = 'CCUSER'
+AND    tc.table_name = 'CC_ACTIVITY'
+ORDER BY tc.column_name;
